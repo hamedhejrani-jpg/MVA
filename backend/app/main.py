@@ -7,8 +7,9 @@ import uuid
 import os
 import urllib.request
 import urllib.error
+import asyncio
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -144,6 +145,75 @@ def ai_test() -> dict[str, Any]:
     except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError) as exc:
         # Do not reveal URL, key, or raw provider response in the API output.
         return {"ok": False, "enabled": True, "message": "اتصال آزمون برقرار نشد. نشانی سرویس، مدل و کلید را بررسی کنید.", "error_type": type(exc).__name__}
+
+
+@app.get("/api/speech/status")
+def speech_status() -> dict[str, Any]:
+    configured = bool(os.getenv("HF_TOKEN"))
+    return {
+        "configured": configured,
+        "provider": "Hugging Face Inference Providers",
+        "model": "openai/whisper-large-v3",
+        "message": "برای تبدیل گفتار به متن، توکن HF_TOKEN باید در محیط سرور تنظیم شده باشد.",
+        "stores_audio": False,
+    }
+
+
+def _transcribe_audio(audio: bytes, content_type: str, token: str) -> dict[str, Any]:
+    url = "https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3"
+    request = urllib.request.Request(
+        url,
+        data=audio,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": content_type,
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # Do not expose the token or raw upstream response to the browser.
+        if exc.code in (401, 403):
+            raise HTTPException(status_code=502, detail="توکن Hugging Face معتبر نیست یا دسترسی Inference Providers ندارد.") from None
+        if exc.code == 429:
+            raise HTTPException(status_code=503, detail="سهمیه یا ظرفیت سرویس گفتار فعلاً کافی نیست؛ کمی بعد دوباره تلاش کنید.") from None
+        if exc.code in (400, 422):
+            raise HTTPException(status_code=422, detail="فرمت صدا پشتیبانی نشد؛ دوباره ضبط کنید و کوتاه‌تر صحبت کنید.") from None
+        raise HTTPException(status_code=502, detail="سرویس تشخیص گفتار پاسخ مناسبی نداد.") from None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise HTTPException(status_code=502, detail="اتصال به سرویس تشخیص گفتار برقرار نشد.") from None
+
+    if isinstance(result, dict):
+        transcript = result.get("text", "")
+    elif isinstance(result, str):
+        transcript = result
+    else:
+        transcript = ""
+    transcript = str(transcript).strip()
+    if not transcript:
+        raise HTTPException(status_code=502, detail="متنی از صدا تشخیص داده نشد؛ لطفاً واضح‌تر و دوباره ضبط کنید.")
+    return {"text": transcript[:2000], "provider": "huggingface", "stored": False}
+
+
+@app.post("/api/speech/transcribe")
+async def transcribe_speech(request: Request) -> dict[str, Any]:
+    token = os.getenv("HF_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="توکن HF_TOKEN تنظیم نشده است.")
+    content_type = request.headers.get("content-type", "audio/webm").split(";")[0].strip().lower()
+    allowed_types = {"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav"}
+    if content_type not in allowed_types:
+        raise HTTPException(status_code=415, detail="فرمت ضبط صدا پشتیبانی نمی‌شود. مرورگر را به‌روز کنید.")
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="فایل صدای خالی دریافت شد.")
+    if len(audio) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="ضبط صدا باید کمتر از ۱۰ مگابایت باشد.")
+    # Audio is processed in memory only and is not written to disk.
+    return await asyncio.to_thread(_transcribe_audio, audio, content_type, token)
 
 
 @app.post("/api/validate")
