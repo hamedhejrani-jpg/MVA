@@ -516,6 +516,8 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
         ("serial_number", "شماره سریال تلویزیون چیست؟"),
     ]
     next_question = next((q for key, q in questions if not str(data.get(key, "")).strip()), None)
+    if next_question is None and len(normalize_spoken_digits(str(data.get("national_id", "")))) != 10:
+        next_question = "کد ملی باید ۱۰ رقم باشد؛ لطفاً آن را آرام و در دو بخش پنج‌رقمی بفرمایید."
     if next_question is None:
         if not data.get("phone", "").strip():
             next_question = "شماره تلفن ثابت را بفرمایید؛ اگر ندارید، بگویید تا دو شماره همراه ثبت کنیم."
