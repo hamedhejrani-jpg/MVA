@@ -313,70 +313,96 @@ def validate_request(payload: InstallationRequest) -> dict[str, Any]:
     return {"valid": not issues, "issues": issues}
 
 
+def _ai_conversation_turn(message: str, current_data: dict[str, Any]) -> dict[str, Any]:
+    token = os.getenv("OPENAI_API_KEY", "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured.")
+    instructions = (
+        "You are a Persian Farsi call-center assistant collecting a TV installation request. "
+        "The user's message may be speech transcription. Extract only values clearly stated; never guess or invent. "
+        "Merge with existing values and do not erase them. If one utterance includes multiple answers, fill all matching fields. "
+        "Ask only for the next missing item. When all fields are present, summarize and ask for explicit confirmation. "
+        "Set confirmed=true only if the user explicitly confirms the final summary. "
+        "Return JSON only with keys fields, reply, confirmed. fields must contain the full merged object. "
+        "Allowed fields are exactly the keys in current_fields. Normalize install_type to دیواری or زمینی. "
+        "Keep replies brief and natural in Persian."
+    )
+    body = {
+        "model": os.getenv("MVA_CONVERSATION_MODEL", "gpt-4o-mini"),
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps({
+                "current_fields": current_data,
+                "latest_utterance": message,
+            }, ensure_ascii=False)},
+        ],
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        parsed = json.loads(result["choices"][0]["message"]["content"])
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("fields"), dict):
+            raise ValueError("Invalid AI result")
+        return parsed
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise HTTPException(status_code=502, detail="OpenAI API key is invalid or lacks chat access.") from None
+        if exc.code == 429:
+            raise HTTPException(status_code=503, detail="OpenAI API quota or rate limit reached.") from None
+        raise HTTPException(status_code=502, detail="AI could not process this answer.") from None
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError):
+        raise HTTPException(status_code=502, detail="AI response could not be processed. Please repeat your answer.") from None
+
+
 @app.post("/api/conversation/message")
 def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
     text = payload.message.strip()
     session_id = payload.session_id or str(uuid.uuid4())
-    state = SESSIONS.setdefault(session_id, {"step": 0, "data": {"product": "تلویزیون"}})
     if text.lower() in ("شروع", "شروع مجدد", "از اول", "reset"):
         state = {"step": 0, "data": {"product": "تلویزیون"}}
         SESSIONS[session_id] = state
-        return {"session_id": session_id, "reply": "سلام، وقتتون بخیر. برای ثبت درخواست نصب تلویزیون چند مورد کوتاه می‌پرسم. لطفاً نام و نام خانوادگی مشتری را بفرمایید.", "done": False, "data": state["data"]}
+        return {
+            "session_id": session_id,
+            "reply": "سلام، وقتتون بخیر. برای ثبت درخواست نصب تلویزیون صحبت می‌کنیم. لطفاً نام و نام خانوادگی مشتری را بفرمایید؛ اگر اطلاعات دیگری هم آماده است، می‌توانید یک‌جا بگویید.",
+            "done": False,
+            "data": state["data"],
+        }
 
-    step, data = state["step"], state["data"]
-    if step == 0:
-        if not text:
-            reply = "سلام، وقتتون بخیر. برای ثبت درخواست نصب تلویزیون چند مورد کوتاه می‌پرسم. لطفاً نام و نام خانوادگی مشتری را بفرمایید."
-        else:
-            data["full_name"] = text
-            state["step"] = 1
-            reply = "ممنون. حالا کد ملی ۱۰ رقمی مشتری را بفرمایید."
-    elif step == 1:
-        data["national_id"] = text
-        state["step"] = 2
-        reply = "لطفاً شماره تلفن ثابت و همراه را بفرمایید؛ یا اگر تلفن ثابت ندارید، دو شماره همراه وارد کنید. شماره‌ها را با ویرگول جدا کنید."
-    elif step == 2:
-        parts = [p.strip() for p in re.split(r"[,،;/|]+", text) if p.strip()]
-        if len(parts) >= 2:
-            first, second = parts[0], parts[1]
-            if valid_mobile(first) and valid_mobile(second):
-                data["mobile"], data["mobile2"], data["phone"] = first, second, ""
-            else:
-                data["phone"], data["mobile"] = first, second
-        else:
-            data["mobile"] = text
-        state["step"] = 3
-        reply = "محصول این درخواست تلویزیون است. اگر درست است بگویید «تأیید»؛ در غیر این صورت نام محصول را بفرمایید."
-    elif step == 3:
-        data["product"] = "تلویزیون" if text in ("تأیید", "تایید", "بله", "آره", "درسته") else text
-        state["step"] = 4
-        reply = "لطفاً شماره سریال تلویزیون را بفرمایید."
-    elif step == 4:
-        data["serial_number"] = text
-        state["step"] = 5
-        reply = "نوع نصب را مشخص کنید: دیواری یا زمینی (روی پایه)."
-    elif step == 5:
-        normalized = text.replace("ي", "ی").replace("ك", "ک")
-        if "دیواری" in normalized or "دیوار" in normalized:
-            data["install_type"] = "دیواری"
-        elif "زمینی" in normalized or "پایه" in normalized:
-            data["install_type"] = "زمینی"
-        else:
-            return {"session_id": session_id, "reply": "لطفاً یکی از این دو گزینه را بفرمایید: نصب دیواری یا زمینی (روی پایه).", "done": False, "data": data}
-        state["step"] = 6
-        reply = (f"لطفاً بررسی کنید: نام: {data.get('full_name','')}؛ کد ملی: {data.get('national_id','')}؛ "
-                 f"تلفن ثابت: {data.get('phone') or 'ثبت نشده'}؛ همراه اول: {data.get('mobile','')}؛ "
-                 f"همراه دوم: {data.get('mobile2') or 'ثبت نشده'}؛ محصول: {data.get('product','تلویزیون')}؛ "
-                 f"سریال: {data.get('serial_number','')}؛ نوع نصب: {data.get('install_type','')}. اگر درست است بگویید تأیید.")
-    else:
-        if text in ("تأیید", "تایید", "بله", "درسته", "تأیید می‌کنم"):
-            data["consent_confirmed"] = True
-            request = InstallationRequest(**data)
-            issues = validation_issues(request)
-            if issues:
-                return {"session_id": session_id, "reply": "چند مورد نیاز به اصلاح دارد: " + " ".join(x["message"] for x in issues), "done": False, "data": data, "issues": issues}
-            return {"session_id": session_id, "reply": "اطلاعات تأیید شد. این نسخه فقط خروجی آزمایشی محلی می‌سازد و درخواست را به سامانه یا مرکز تماس ارسال نمی‌کند.", "done": True, "data": data}
-        return {"session_id": session_id, "reply": "برای جلوگیری از اشتباه، لطفاً بگویید «تأیید» یا «شروع مجدد».", "done": False, "data": data}
+    state = SESSIONS.setdefault(session_id, {"step": 0, "data": {"product": "تلویزیون"}})
+    data = state["data"]
+    parsed = _ai_conversation_turn(text, data)
+    fields = parsed["fields"]
+    allowed = {"full_name", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type", "consent_confirmed"}
+    for key in allowed:
+        value = fields.get(key)
+        if value is not None and str(value).strip():
+            data[key] = value if key == "consent_confirmed" else str(value).strip()
+
+    install = str(data.get("install_type", "")).replace("ي", "ی").replace("ك", "ک")
+    if "دیواری" in install or "دیوار" in install:
+        data["install_type"] = "دیواری"
+    elif "زمینی" in install or "پایه" in install:
+        data["install_type"] = "زمینی"
+
+    reply = str(parsed.get("reply", "")).strip() or "متوجه شدم. لطفاً پاسخ را دوباره بفرمایید."
+    if parsed.get("confirmed") is True:
+        request_data = InstallationRequest(**{
+            **{k: data.get(k, "") for k in ("full_name", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type")},
+            "consent_confirmed": True,
+        })
+        issues = validation_issues(request_data)
+        if issues:
+            return {"session_id": session_id, "reply": "برای تکمیل درخواست، لطفاً این موارد را اصلاح کنید: " + " ".join(i["message"] for i in issues), "done": False, "data": data, "issues": issues}
+        data["consent_confirmed"] = True
+        return {"session_id": session_id, "reply": "ممنون، اطلاعات تأیید شد. این نسخه فقط خروجی آزمایشی محلی می‌سازد و چیزی به مرکز تماس یا سامانه بیرونی ارسال نمی‌کند.", "done": True, "data": data}
     return {"session_id": session_id, "reply": reply, "done": False, "data": data}
 
 
