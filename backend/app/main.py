@@ -388,7 +388,7 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
 
     state = SESSIONS.setdefault(session_id, {"step": 0, "data": {"product": "تلویزیون"}})
     data = state["data"]
-    normalized_text = text.replace("ي", "ی").replace("ك", "ک").strip()
+    normalized_text = text.replace("ي", "ی").replace("ك", "ک").replace("؟", "").replace("?", "").replace(".", "").replace("،", "").strip()
     negative_answers = {"نه", "خیر", "درست نیست", "اشتباهه", "اشتباه است", "من نیستم", "نه درست نیست"}
     if state.get("awaiting_name_confirmation") and normalized_text in negative_answers:
         data.pop("full_name", None)
