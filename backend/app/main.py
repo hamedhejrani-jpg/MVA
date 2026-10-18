@@ -217,6 +217,9 @@ def _transcribe_audio(audio: bytes, content_type: str, token: str) -> dict[str, 
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="language"\r\n\r\n'
         "fa\r\n",
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+        "گفتار فقط فارسی ایران است. فقط همان چیزی را که به فارسی گفته شده بنویس؛ ترجمه نکن و متن انگلیسی یا روسی نساز. اگر واژه‌ای واضح نیست، حدس نزن. عبارت‌های نصب: دیواری، روی دیوار، زمینی، روی میز، روی پایه.\r\n",
     ]
     body = "".join(parts).encode("utf-8")
     body += (
@@ -318,14 +321,19 @@ def _ai_conversation_turn(message: str, current_data: dict[str, Any]) -> dict[st
     if not token:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured.")
     instructions = (
-        "You are a Persian Farsi call-center assistant collecting a TV installation request. "
-        "The user's message may be speech transcription. Extract only values clearly stated; never guess or invent. "
-        "Merge with existing values and do not erase them. If one utterance includes multiple answers, fill all matching fields. "
-        "Ask only for the next missing item. When all fields are present, summarize and ask for explicit confirmation. "
-        "Set confirmed=true only if the user explicitly confirms the final summary. "
+        "You are a Persian-only Iranian Farsi call-center assistant collecting a TV installation request. "
+        "STRICT LANGUAGE RULE: understand and respond only to Persian (Farsi). Every reply must be entirely in Persian. "
+        "If latest_utterance is English, Russian, another language, garbled, or unclear, do not interpret it as an answer; "
+        "leave all fields unchanged and ask in Persian: «متوجه پاسخ نشدم؛ لطفاً فقط فارسی و واضح بفرمایید.» "
+        "Do not output Latin/Cyrillic words in reply. Preserve proper names, model codes, phone numbers, and serial numbers as data when clearly spoken. "
+        "Extract only values clearly stated; never guess or invent. Merge with existing values and never erase existing values. "
+        "If one utterance includes multiple answers, fill all matching fields. Ask only for the next missing item. "
+        "For installation type, دیواری means دیواری/روی دیوار/به دیوار; زمینی means زمینی/روی میز/روی پایه/پایه‌دار/روی میز تلویزیون. "
+        "Treat these everyday Persian phrases as clear answers, not as a reason to repeat the question. Normalize install_type to exactly دیواری or زمینی. "
+        "Ask the installation question exactly as «نوع نصب را می‌خواهید دیواری باشد یا روی میز/پایه؟» if still missing. "
+        "When all fields are present, summarize in Persian and ask for explicit confirmation. Set confirmed=true only if the user explicitly confirms the final summary. "
         "Return JSON only with keys fields, reply, confirmed. fields must contain the full merged object. "
-        "Allowed fields are exactly the keys in current_fields. Normalize install_type to دیواری or زمینی. "
-        "Keep replies brief and natural in Persian."
+        "Allowed fields are exactly the keys in current_fields. Keep replies brief and natural in Persian."
     )
     body = {
         "model": os.getenv("MVA_CONVERSATION_MODEL", "gpt-4o-mini"),
@@ -386,10 +394,18 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
         if value is not None and str(value).strip():
             data[key] = value if key == "consent_confirmed" else str(value).strip()
 
+    # Deterministic normalization for common spoken Persian answers.
+    # These phrases are unambiguous and should not depend on the model's wording.
+    utterance = text.replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ")
+    if any(term in utterance for term in ("دیواری", "روی دیوار", "به دیوار", "نصب به دیوار")):
+        data["install_type"] = "دیواری"
+    elif any(term in utterance for term in ("زمینی", "روی میز", "روی پایه", "پایه دار", "پایه‌دار", "روی میز تلویزیون")):
+        data["install_type"] = "زمینی"
+
     install = str(data.get("install_type", "")).replace("ي", "ی").replace("ك", "ک")
     if "دیواری" in install or "دیوار" in install:
         data["install_type"] = "دیواری"
-    elif "زمینی" in install or "پایه" in install:
+    elif "زمینی" in install or "پایه" in install or "میز" in install:
         data["install_type"] = "زمینی"
 
     reply = str(parsed.get("reply", "")).strip() or "متوجه شدم. لطفاً پاسخ را دوباره بفرمایید."
