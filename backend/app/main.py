@@ -147,73 +147,126 @@ def ai_test() -> dict[str, Any]:
         return {"ok": False, "enabled": True, "message": "اتصال آزمون برقرار نشد. نشانی سرویس، مدل و کلید را بررسی کنید.", "error_type": type(exc).__name__}
 
 
+
+
 @app.get("/api/speech/status")
 def speech_status() -> dict[str, Any]:
-    configured = bool(os.getenv("HF_TOKEN"))
+    configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
     return {
         "configured": configured,
-        "provider": "Hugging Face Inference Providers",
-        "model": "openai/whisper-large-v3",
-        "message": "برای تبدیل گفتار به متن، توکن HF_TOKEN باید در محیط سرور تنظیم شده باشد.",
+        "provider": "OpenAI",
+        "model": "gpt-4o-mini-transcribe",
+        "message": "Speech transcription uses the OpenAI API key.",
         "stores_audio": False,
     }
 
 
 def _transcribe_audio(audio: bytes, content_type: str, token: str) -> dict[str, Any]:
-    url = "https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3"
+    boundary = "----MVAOpenAIBoundary7MA4YWxk"
+    filename = {
+        "audio/webm": "recording.webm",
+        "audio/ogg": "recording.ogg",
+        "audio/mp4": "recording.mp4",
+        "audio/mpeg": "recording.mp3",
+        "audio/wav": "recording.wav",
+        "audio/x-wav": "recording.wav",
+    }.get(content_type, "recording.webm")
+
+    parts = [
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="model"\r\n\r\n'
+        "gpt-4o-mini-transcribe\r\n",
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="language"\r\n\r\n'
+        "fa\r\n",
+    ]
+    body = "".join(parts).encode("utf-8")
+    body += (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8")
+    body += audio
+    body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+
     request = urllib.request.Request(
-        url,
-        data=audio,
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
         headers={
             "Authorization": "Bearer " + token,
-            "Content-Type": content_type,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Accept": "application/json",
         },
         method="POST",
     )
+
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        # Do not expose the token or raw upstream response to the browser.
         if exc.code in (401, 403):
-            raise HTTPException(status_code=502, detail="توکن Hugging Face معتبر نیست یا دسترسی Inference Providers ندارد.") from None
+            raise HTTPException(
+                status_code=502,
+                detail="OpenAI API key is invalid or lacks access."
+            ) from None
         if exc.code == 429:
-            raise HTTPException(status_code=503, detail="سهمیه یا ظرفیت سرویس گفتار فعلاً کافی نیست؛ کمی بعد دوباره تلاش کنید.") from None
-        if exc.code in (400, 422):
-            raise HTTPException(status_code=422, detail="فرمت صدا پشتیبانی نشد؛ دوباره ضبط کنید و کوتاه‌تر صحبت کنید.") from None
-        raise HTTPException(status_code=502, detail="سرویس تشخیص گفتار پاسخ مناسبی نداد.") from None
+            raise HTTPException(
+                status_code=503,
+                detail="OpenAI API quota or rate limit reached."
+            ) from None
+        if exc.code in (400, 413, 415, 422):
+            raise HTTPException(
+                status_code=422,
+                detail="Audio format or request was rejected. Please record again."
+            ) from None
+        raise HTTPException(
+            status_code=502,
+            detail="Speech transcription service returned an error."
+        ) from None
     except (urllib.error.URLError, TimeoutError, ValueError):
-        raise HTTPException(status_code=502, detail="اتصال به سرویس تشخیص گفتار برقرار نشد.") from None
+        raise HTTPException(
+            status_code=502,
+            detail="Could not connect to the speech transcription service."
+        ) from None
 
-    if isinstance(result, dict):
-        transcript = result.get("text", "")
-    elif isinstance(result, str):
-        transcript = result
-    else:
-        transcript = ""
-    transcript = str(transcript).strip()
+    transcript = str(result.get("text", "")).strip() if isinstance(result, dict) else ""
     if not transcript:
-        raise HTTPException(status_code=502, detail="متنی از صدا تشخیص داده نشد؛ لطفاً واضح‌تر و دوباره ضبط کنید.")
-    return {"text": transcript[:2000], "provider": "huggingface", "stored": False}
+        raise HTTPException(
+            status_code=502,
+            detail="No speech was detected. Please speak clearly and try again."
+        )
+    return {"text": transcript[:2000], "provider": "openai", "stored": False}
 
 
 @app.post("/api/speech/transcribe")
 async def transcribe_speech(request: Request) -> dict[str, Any]:
-    token = os.getenv("HF_TOKEN", "").strip()
+    token = os.getenv("OPENAI_API_KEY", "").strip()
     if not token:
-        raise HTTPException(status_code=503, detail="توکن HF_TOKEN تنظیم نشده است.")
-    content_type = request.headers.get("content-type", "audio/webm").split(";")[0].strip().lower()
-    allowed_types = {"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav"}
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY is not configured in the server environment."
+        )
+
+    content_type = request.headers.get(
+        "content-type", "audio/webm"
+    ).split(";")[0].strip().lower()
+
+    allowed_types = {
+        "audio/webm", "audio/ogg", "audio/mp4",
+        "audio/mpeg", "audio/wav", "audio/x-wav"
+    }
     if content_type not in allowed_types:
-        raise HTTPException(status_code=415, detail="فرمت ضبط صدا پشتیبانی نمی‌شود. مرورگر را به‌روز کنید.")
+        raise HTTPException(status_code=415, detail="Unsupported audio format.")
+
     audio = await request.body()
     if not audio:
-        raise HTTPException(status_code=400, detail="فایل صدای خالی دریافت شد.")
+        raise HTTPException(status_code=400, detail="Received an empty audio file.")
     if len(audio) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="ضبط صدا باید کمتر از ۱۰ مگابایت باشد.")
-    # Audio is processed in memory only and is not written to disk.
-    return await asyncio.to_thread(_transcribe_audio, audio, content_type, token)
+        raise HTTPException(status_code=413, detail="Audio must be smaller than 10 MB.")
+
+    return await asyncio.to_thread(
+        _transcribe_audio, audio, content_type, token
+    )
 
 
 @app.post("/api/validate")
