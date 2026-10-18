@@ -76,8 +76,12 @@ def validation_issues(data: InstallationRequest) -> list[dict[str, str]]:
     issues: list[dict[str, str]] = []
     if not data.full_name.strip():
         issues.append({"field": "full_name", "message": "نام و نام خانوادگی وارد نشده است."})
-    if len(normalize_digits(data.national_id)) != 10:
+    if len(normalize_spoken_digits(data.national_id)) != 10:
         issues.append({"field": "national_id", "message": "کد ملی باید ۱۰ رقم باشد."})
+    if not data.model.strip():
+        issues.append({"field": "model", "message": "مدل تلویزیون وارد نشده است."})
+    if not data.address.strip():
+        issues.append({"field": "address", "message": "آدرس نصب وارد نشده است."})
     mobiles = [x for x in (data.mobile, data.mobile2) if x.strip()]
     if data.phone.strip():
         if len(normalize_digits(data.phone)) < 8:
@@ -342,7 +346,9 @@ def _ai_conversation_turn(message: str, current_data: dict[str, Any]) -> dict[st
         "Ask for repetition only when the utterance is genuinely unintelligible or clearly unrelated; never classify a plausible Persian name as a foreign language. "
         "Keep all assistant replies in Persian. Preserve product model codes, phone numbers, and serial numbers when clearly stated. "
         "Extract only values clearly stated; never guess or invent. Merge with existing values and never erase them, except when the user explicitly rejects a value such as a name. "
-        "If one utterance includes multiple answers, fill all matching fields. Ask only for the next missing item. "
+        "If one utterance includes multiple answers, fill all matching fields. Store TV model code in model, address in address, and product serial in serial_number. "
+        "For national_id, phone, mobile, mobile2 and serial_number, convert clearly spoken digit-by-digit Persian number words to ASCII digits 0-9 and preserve leading zeroes. Never guess unclear digits. "
+        "Ask only the next missing item with a specific short question; never say «مورد بعدی را بفرمایید». "
         "For installation type, دیواری means دیواری/روی دیوار/به دیوار; زمینی means زمینی/روی میز/روی پایه/پایه‌دار/روی میز تلویزیون. "
         "Treat these everyday Persian phrases as clear answers, not as a reason to repeat the question. Normalize install_type to exactly دیواری or زمینی. "
         "Ask the installation question exactly as «نوع نصب را می‌خواهید دیواری باشد یا روی میز/پایه؟» if still missing. "
@@ -430,7 +436,7 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
         return {"session_id": session_id, "reply": "نام صحیح چیست؟", "done": False, "data": data}
     parsed = _ai_conversation_turn(text, data)
     fields = parsed["fields"]
-    allowed = {"full_name", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type", "consent_confirmed"}
+    allowed = {"full_name", "model", "address", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type", "consent_confirmed"}
     for key in allowed:
         value = fields.get(key)
         if value is not None and str(value).strip():
@@ -450,14 +456,37 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
     elif "زمینی" in install or "پایه" in install or "میز" in install:
         data["install_type"] = "زمینی"
 
-    reply = str(parsed.get("reply", "")).strip() or "متوجه شدم. لطفاً پاسخ را دوباره بفرمایید."
+    for key in ("national_id", "phone", "mobile", "mobile2", "serial_number"):
+        if data.get(key):
+            converted = normalize_spoken_digits(str(data[key]))
+            if converted:
+                data[key] = converted
+    reply = str(parsed.get("reply", "")).strip() or "متوجه شدم."
     if data.get("full_name") and "نام" in reply and any(word in reply for word in ("درست", "صحیح", "تأیید")):
         state["awaiting_name_confirmation"] = True
-    if data.get("install_type") in ("دیواری", "زمینی") and any(x in reply for x in ("نوع نصب", "دیواری باشد یا")):
-        reply = "ثبت شد. مورد بعدی را بفرمایید."
+
+    # Always ask the next specific missing question in a stable order.
+    questions = [
+        ("full_name", "نام و نام خانوادگی مشتری چیست؟"),
+        ("model", "مدل تلویزیون چیست؟"),
+        ("install_type", "نصب دیواری است یا روی میز/پایه؟"),
+        ("address", "آدرس کامل محل نصب چیست؟"),
+        ("national_id", "کد ملی مشتری را بفرمایید."),
+        ("serial_number", "شماره سریال تلویزیون چیست؟"),
+    ]
+    next_question = next((q for key, q in questions if not str(data.get(key, "")).strip()), None)
+    if next_question is None:
+        if not data.get("phone", "").strip():
+            next_question = "شماره تلفن ثابت را بفرمایید؛ اگر ندارید، بگویید تا دو شماره همراه ثبت کنیم."
+        elif not data.get("mobile", "").strip():
+            next_question = "شماره همراه مشتری را بفرمایید."
+        elif not data.get("mobile2", "").strip():
+            next_question = "شماره همراه دوم را بفرمایید."
+    if next_question and not state.get("awaiting_name_confirmation"):
+        reply = next_question
     if parsed.get("confirmed") is True:
         request_data = InstallationRequest(**{
-            **{k: data.get(k, "") for k in ("full_name", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type")},
+            **{k: data.get(k, "") for k in ("full_name", "model", "address", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type")},
             "consent_confirmed": True,
         })
         issues = validation_issues(request_data)
