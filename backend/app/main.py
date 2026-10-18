@@ -55,13 +55,54 @@ def normalize_digits(value: str) -> str:
 
 
 def normalize_spoken_digits(value: str) -> str:
-    """Convert Persian digit words spoken one by one to ASCII digits."""
+    """Normalize numeric fields from Persian digit-by-digit speech or grouped number words."""
     text = (value or "").replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ").strip()
-    words = {"صفر":"0", "یک":"1", "اول":"1", "دو":"2", "سه":"3", "چهار":"4",
-             "پنج":"5", "شش":"6", "شیش":"6", "هفت":"7", "هشت":"8", "نه":"9"}
-    tokens = re.findall(r"[آ-ی]+|[0-9۰-۹٠-٩]+", text)
-    if tokens and all(token in words or re.fullmatch(r"[0-9۰-۹٠-٩]+", token) for token in tokens):
-        return "".join(words.get(token, normalize_digits(token)) for token in tokens)
+    digit_words = {"صفر":"0", "یک":"1", "اول":"1", "دو":"2", "سه":"3", "چهار":"4",
+                   "پنج":"5", "شش":"6", "شیش":"6", "هفت":"7", "هشت":"8", "نه":"9"}
+    if re.fullmatch(r"[0-9۰-۹٠-٩\s\-]+", text):
+        return normalize_digits(text)
+
+    # A caller may dictate a long ID in chunks, e.g. "چهارصد و یک، صد و هشتاد و هشت..."
+    # Convert each comma/phrase chunk separately, then concatenate the resulting digits.
+    units = {"یک":1, "اول":1, "دو":2, "سه":3, "چهار":4, "پنج":5, "شش":6, "شیش":6,
+             "هفت":7, "هشت":8, "نه":9}
+    tens = {"ده":10, "یازده":11, "دوازده":12, "سیزده":13, "چهارده":14, "پانزده":15,
+            "شانزده":16, "هفده":17, "هجده":18, "نوزده":19, "بیست":20, "سی":30,
+            "چهل":40, "پنجاه":50, "شصت":60, "هفتاد":70, "هشتاد":80, "نود":90}
+    hundreds = {"صد":100, "یکصد":100, "دویست":200, "سیصد":300, "چهارصد":400,
+                "پانصد":500, "ششصد":600, "هفتصد":700, "هشتصد":800, "نهصد":900}
+    def parse_chunk(chunk: str):
+        tokens = [t for t in re.findall(r"[آ-ی]+|[0-9۰-۹٠-٩]+", chunk) if t != "و"]
+        if not tokens:
+            return None
+        if all(t in digit_words or re.fullmatch(r"[0-9۰-۹٠-٩]+", t) for t in tokens):
+            return int("".join(digit_words.get(t, normalize_digits(t)) for t in tokens))
+        total = 0
+        current = 0
+        for token in tokens:
+            if re.fullmatch(r"[0-9۰-۹٠-٩]+", token):
+                current += int(normalize_digits(token) or "0")
+            elif token in units:
+                current += units[token]
+            elif token in tens:
+                current += tens[token]
+            elif token in hundreds:
+                current += hundreds[token]
+            elif token == "هزار":
+                total += max(current, 1) * 1000
+                current = 0
+            else:
+                return None
+        return total + current
+
+    chunks = re.split(r"[,،؛;]", text)
+    if len(chunks) > 1:
+        parsed = [parse_chunk(chunk) for chunk in chunks]
+        if all(n is not None for n in parsed):
+            return "".join(str(n) for n in parsed)
+    parsed = parse_chunk(text)
+    if parsed is not None and re.search(r"[آ-ی]", text):
+        return str(parsed)
     return normalize_digits(text)
 
 
@@ -347,7 +388,7 @@ def _ai_conversation_turn(message: str, current_data: dict[str, Any]) -> dict[st
         "Keep all assistant replies in Persian. Preserve product model codes, phone numbers, and serial numbers when clearly stated. "
         "Extract only values clearly stated; never guess or invent. Merge with existing values and never erase them, except when the user explicitly rejects a value such as a name. "
         "If one utterance includes multiple answers, fill all matching fields. Store TV model code in model, address in address, and product serial in serial_number. "
-        "For national_id, phone, mobile, mobile2 and serial_number, convert clearly spoken digit-by-digit Persian number words to ASCII digits 0-9 and preserve leading zeroes. Never guess unclear digits. "
+        "For national_id, phone, mobile, mobile2 and serial_number, convert clearly spoken Persian number words to ASCII digits, including grouped numbers such as چهارصد و یک، صد و هشتاد و هشت. Preserve leading zeroes. If a national ID is not exactly 10 digits after conversion, ask the customer to repeat it slowly in groups of three or four digits; do not ask the identical question without guidance. Never guess unclear digits. "
         "Ask only the next missing item with a specific short question; never say «مورد بعدی را بفرمایید». "
         "For installation type, دیواری means دیواری/روی دیوار/به دیوار; زمینی means زمینی/روی میز/روی پایه/پایه‌دار/روی میز تلویزیون. "
         "Treat these everyday Persian phrases as clear answers, not as a reason to repeat the question. Normalize install_type to exactly دیواری or زمینی. "
