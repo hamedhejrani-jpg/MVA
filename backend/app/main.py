@@ -9,7 +9,7 @@ import urllib.request
 import urllib.error
 import asyncio
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -147,6 +147,44 @@ def ai_test() -> dict[str, Any]:
         return {"ok": False, "enabled": True, "message": "اتصال آزمون برقرار نشد. نشانی سرویس، مدل و کلید را بررسی کنید.", "error_type": type(exc).__name__}
 
 
+
+
+class SpeechSynthesisRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+
+
+@app.post("/api/speech/synthesize")
+def synthesize_speech(payload: SpeechSynthesisRequest) -> Response:
+    token = os.getenv("OPENAI_API_KEY", "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured.")
+    body = json.dumps({
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "input": payload.text.strip(),
+        "instructions": "Speak naturally and clearly in Persian (Farsi), with an Iranian Persian accent. Keep a warm, professional call-center tone. Read numbers clearly.",
+        "response_format": "mp3",
+    }, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/audio/speech",
+        data=body,
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            audio = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise HTTPException(status_code=502, detail="OpenAI API key is invalid or lacks speech access.") from None
+        if exc.code == 429:
+            raise HTTPException(status_code=503, detail="OpenAI API quota or rate limit reached.") from None
+        raise HTTPException(status_code=502, detail="Persian speech generation failed.") from None
+    except (urllib.error.URLError, TimeoutError):
+        raise HTTPException(status_code=502, detail="Could not connect to the speech service.") from None
+    if not audio:
+        raise HTTPException(status_code=502, detail="The speech service returned empty audio.")
+    return Response(content=audio, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/speech/status")
