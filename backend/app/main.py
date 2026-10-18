@@ -396,7 +396,7 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
     text = payload.message.strip()
     session_id = payload.session_id or str(uuid.uuid4())
     if text.lower() in ("شروع", "شروع مجدد", "از اول", "reset"):
-        state = {"step": 0, "data": {"product": "تلویزیون"}}
+        state = {"step": 0, "data": {"product": "تلویزیون", "full_name": "", "model": "", "address": "", "national_id": "", "phone": "", "mobile": "", "mobile2": "", "serial_number": "", "install_type": "", "consent_confirmed": False}}
         SESSIONS[session_id] = state
         return {
             "session_id": session_id,
@@ -405,7 +405,7 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
             "data": state["data"],
         }
 
-    state = SESSIONS.setdefault(session_id, {"step": 0, "data": {"product": "تلویزیون"}})
+    state = SESSIONS.setdefault(session_id, {"step": 0, "data": {"product": "تلویزیون", "full_name": "", "model": "", "address": "", "national_id": "", "phone": "", "mobile": "", "mobile2": "", "serial_number": "", "install_type": "", "consent_confirmed": False}})
     data = state["data"]
     normalized_text = text.replace("ي", "ی").replace("ك", "ک").replace("؟", "").replace("?", "").replace(".", "").replace("،", "").strip()
     negative_answers = {"نه", "خیر", "درست نیست", "اشتباهه", "اشتباه است", "من نیستم", "نه درست نیست"}
