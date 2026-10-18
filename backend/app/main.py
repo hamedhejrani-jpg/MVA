@@ -328,7 +328,7 @@ def _ai_conversation_turn(message: str, current_data: dict[str, Any]) -> dict[st
         "For a likely customer name, store the recognized Persian words in full_name even if spelling is uncertain, then ask the customer to confirm the spelling in Persian. "
         "Ask for repetition only when the utterance is genuinely unintelligible or clearly unrelated; never classify a plausible Persian name as a foreign language. "
         "Keep all assistant replies in Persian. Preserve product model codes, phone numbers, and serial numbers when clearly stated. "
-        "Extract only values clearly stated; never guess or invent. Merge with existing values and never erase existing values. "
+        "Extract only values clearly stated; never guess or invent. Merge with existing values and never erase them, except when the user explicitly rejects a value such as a name. "
         "If one utterance includes multiple answers, fill all matching fields. Ask only for the next missing item. "
         "For installation type, دیواری means دیواری/روی دیوار/به دیوار; زمینی means زمینی/روی میز/روی پایه/پایه‌دار/روی میز تلویزیون. "
         "Treat these everyday Persian phrases as clear answers, not as a reason to repeat the question. Normalize install_type to exactly دیواری or زمینی. "
@@ -381,13 +381,27 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
         SESSIONS[session_id] = state
         return {
             "session_id": session_id,
-            "reply": "سلام، وقتتون بخیر. برای ثبت درخواست نصب تلویزیون صحبت می‌کنیم. لطفاً نام و نام خانوادگی مشتری را بفرمایید؛ اگر اطلاعات دیگری هم آماده است، می‌توانید یک‌جا بگویید.",
+            "reply": "سلام! نام و نام خانوادگی؟ اگر آماده است، مدل تلویزیون را هم بگویید.",
             "done": False,
             "data": state["data"],
         }
 
     state = SESSIONS.setdefault(session_id, {"step": 0, "data": {"product": "تلویزیون"}})
     data = state["data"]
+    normalized_text = text.replace("ي", "ی").replace("ك", "ک").strip()
+    negative_answers = {"نه", "خیر", "درست نیست", "اشتباهه", "اشتباه است", "من نیستم", "نه درست نیست"}
+    if state.get("awaiting_name_confirmation") and normalized_text in negative_answers:
+        data.pop("full_name", None)
+        state["awaiting_name_confirmation"] = False
+        state["awaiting_name_input"] = True
+        return {"session_id": session_id, "reply": "نام صحیح شما چیست؟", "done": False, "data": data}
+    if state.get("awaiting_name_input"):
+        if len(normalized_text.split()) >= 2 and len(normalized_text) <= 100:
+            data["full_name"] = normalized_text
+            state["awaiting_name_input"] = False
+            state["awaiting_name_confirmation"] = True
+            return {"session_id": session_id, "reply": f"نام شما «{normalized_text}» است؛ درست است؟", "done": False, "data": data}
+        return {"session_id": session_id, "reply": "لطفاً نام و نام خانوادگی را بفرمایید.", "done": False, "data": data}
     parsed = _ai_conversation_turn(text, data)
     fields = parsed["fields"]
     allowed = {"full_name", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type", "consent_confirmed"}
@@ -411,6 +425,10 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
         data["install_type"] = "زمینی"
 
     reply = str(parsed.get("reply", "")).strip() or "متوجه شدم. لطفاً پاسخ را دوباره بفرمایید."
+    if data.get("full_name") and "نام" in reply and any(word in reply for word in ("درست", "صحیح", "تأیید")):
+        state["awaiting_name_confirmation"] = True
+    if data.get("install_type") in ("دیواری", "زمینی") and any(x in reply for x in ("نوع نصب", "دیواری باشد یا")):
+        reply = "ثبت شد. مورد بعدی را بفرمایید."
     if parsed.get("confirmed") is True:
         request_data = InstallationRequest(**{
             **{k: data.get(k, "") for k in ("full_name", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type")},
