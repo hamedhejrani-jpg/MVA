@@ -23,6 +23,8 @@ app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
 
 class InstallationRequest(BaseModel):
     full_name: str = ""
+    model: str = ""
+    address: str = ""
     national_id: str = ""
     phone: str = ""
     mobile: str = ""
@@ -52,8 +54,19 @@ def normalize_digits(value: str) -> str:
     return re.sub(r"\D", "", (value or "").translate(table))
 
 
+def normalize_spoken_digits(value: str) -> str:
+    """Convert Persian digit words spoken one by one to ASCII digits."""
+    text = (value or "").replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ").strip()
+    words = {"صفر":"0", "یک":"1", "اول":"1", "دو":"2", "سه":"3", "چهار":"4",
+             "پنج":"5", "شش":"6", "شیش":"6", "هفت":"7", "هشت":"8", "نه":"9"}
+    tokens = re.findall(r"[آ-ی]+|[0-9۰-۹٠-٩]+", text)
+    if tokens and all(token in words or re.fullmatch(r"[0-9۰-۹٠-٩]+", token) for token in tokens):
+        return "".join(words.get(token, normalize_digits(token)) for token in tokens)
+    return normalize_digits(text)
+
+
 def valid_mobile(value: str) -> bool:
-    number = normalize_digits(value)
+    number = normalize_spoken_digits(value)
     if len(number) == 10 and number.startswith("9"):
         number = "0" + number
     return len(number) == 11 and number.startswith("09")
