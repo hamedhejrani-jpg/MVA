@@ -219,7 +219,7 @@ def _transcribe_audio(audio: bytes, content_type: str, token: str) -> dict[str, 
         "fa\r\n",
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="prompt"\r\n\r\n'
-        "گفتار فقط فارسی ایران است. فقط همان چیزی را که به فارسی گفته شده بنویس؛ ترجمه نکن و متن انگلیسی یا روسی نساز. اگر واژه‌ای واضح نیست، حدس نزن. عبارت‌های نصب: دیواری، روی دیوار، زمینی، روی میز، روی پایه.\r\n",
+        "گفتار فارسی محاوره‌ای ایران است. نام افراد و نام خانوادگی را با دقت و به فارسی بنویس؛ آن‌ها را به واژه‌های نامرتبط تبدیل نکن. متن را ترجمه نکن. عبارت‌های رایج: میثم، حامد، تاجیک، هجرانی، آراسته؛ نصب دیواری، روی دیوار، زمینی، روی میز، روی پایه. اگر نام مبهم است، نزدیک‌ترین شنیده را بنویس تا برنامه از کاربر تأیید بگیرد.\r\n",
     ]
     body = "".join(parts).encode("utf-8")
     body += (
@@ -390,18 +390,31 @@ def conversation_message(payload: ConversationMessage) -> dict[str, Any]:
     data = state["data"]
     normalized_text = text.replace("ي", "ی").replace("ك", "ک").replace("؟", "").replace("?", "").replace(".", "").replace("،", "").strip()
     negative_answers = {"نه", "خیر", "درست نیست", "اشتباهه", "اشتباه است", "من نیستم", "نه درست نیست"}
-    if state.get("awaiting_name_confirmation") and normalized_text in negative_answers:
-        data.pop("full_name", None)
-        state["awaiting_name_confirmation"] = False
-        state["awaiting_name_input"] = True
-        return {"session_id": session_id, "reply": "نام صحیح شما چیست؟", "done": False, "data": data}
+    if state.get("awaiting_name_confirmation"):
+        # If the customer rejects the proposed name and says the correction in the same turn,
+        # use the words after the rejection as the new candidate instead of losing them.
+        correction = normalized_text
+        for prefix in ("نه", "خیر", "اشتباهه", "اشتباه است", "درست نیست", "من نیستم"):
+            if correction.startswith(prefix):
+                correction = correction[len(prefix):].strip(" ،,؛:ـ-")
+                break
+        if normalized_text in negative_answers or not correction:
+            data.pop("full_name", None)
+            state["awaiting_name_confirmation"] = False
+            state["awaiting_name_input"] = True
+            return {"session_id": session_id, "reply": "نام صحیح چیست؟", "done": False, "data": data}
+        if correction != normalized_text and len(correction.split()) >= 2:
+            data["full_name"] = correction
+            state["awaiting_name_confirmation"] = True
+            state["awaiting_name_input"] = False
+            return {"session_id": session_id, "reply": f"نام صحیح «{correction}» است؟", "done": False, "data": data}
     if state.get("awaiting_name_input"):
         if len(normalized_text.split()) >= 2 and len(normalized_text) <= 100:
             data["full_name"] = normalized_text
             state["awaiting_name_input"] = False
             state["awaiting_name_confirmation"] = True
-            return {"session_id": session_id, "reply": f"نام شما «{normalized_text}» است؛ درست است؟", "done": False, "data": data}
-        return {"session_id": session_id, "reply": "لطفاً نام و نام خانوادگی را بفرمایید.", "done": False, "data": data}
+            return {"session_id": session_id, "reply": f"نام «{normalized_text}» درست است؟", "done": False, "data": data}
+        return {"session_id": session_id, "reply": "نام صحیح چیست؟", "done": False, "data": data}
     parsed = _ai_conversation_turn(text, data)
     fields = parsed["fields"]
     allowed = {"full_name", "national_id", "phone", "mobile", "mobile2", "product", "serial_number", "install_type", "consent_confirmed"}
